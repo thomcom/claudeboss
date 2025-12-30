@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from .session import Session
+from .activity import reconstruct_activity, format_timeline_for_display
 
 # Box drawing characters (matching ui.py)
 BOX_H = "─"
@@ -45,6 +46,7 @@ class DetailState:
     session: Session
     file_tree: list[str] = field(default_factory=list)
     temporal_log: list[str] = field(default_factory=list)
+    activity_timeline: list[str] = field(default_factory=list)
     scroll_offset: int = 0
     log_generating: bool = False
     log_gen_frame: int = 0  # For animation
@@ -53,6 +55,12 @@ class DetailState:
     prompt_count: int = 0
     estimated_tokens: int = 0
     estimated_cost: float = 0.0
+
+    # Input mode state
+    input_mode: str = ""  # "", "fork"
+    input_prompt: str = ""
+    input_value: str = ""
+    input_cursor: int = 0
 
 
 class SessionDetailView:
@@ -93,6 +101,7 @@ class SessionDetailView:
         self.state = DetailState(session=session)
         self._load_metadata()
         self._load_file_tree()
+        self._load_activity()
         self._load_temporal_log()
 
     def _load_metadata(self):
@@ -207,6 +216,20 @@ class SessionDetailView:
 
         walk(root, "", 1)
         return lines
+
+    def _load_activity(self):
+        """Load activity timeline from history and debug logs."""
+        if not self.state:
+            return
+
+        session = self.state.session
+        try:
+            timeline = reconstruct_activity(session)
+            _, width = self.stdscr.getmaxyx()
+            col_width = max(30, (width - 7) // 2)
+            self.state.activity_timeline = format_timeline_for_display(timeline, max_width=col_width)
+        except Exception:
+            self.state.activity_timeline = ["[Activity data unavailable]"]
 
     def _load_temporal_log(self):
         """Load or generate temporal log summary."""
@@ -339,7 +362,12 @@ TEMPORAL LOG:"""
         else:
             self._render_single_column(height, width)
 
-        self._render_help(height, width)
+        # Render input overlay if in input mode
+        if self.state.input_mode:
+            self._render_input_dialog(height, width)
+        else:
+            self._render_help(height, width)
+
         self.stdscr.refresh()
 
     def _render_border(self, height: int, width: int):
@@ -465,15 +493,33 @@ TEMPORAL LOG:"""
                 color = curses.color_pair(4) if "📁" in line else curses.A_DIM
                 self._safe_addstr(start_row + i, 2, line, color, col_width)
 
-        # Right column: temporal log
+        # Right column: activity timeline + temporal log
         log_x = divider_x + 2
+
+        # Activity timeline section (compact, at top)
+        activity = self.state.activity_timeline
+        activity_rows = min(len(activity), visible_rows // 3)  # Use up to 1/3 of space
+
+        for i in range(activity_rows):
+            line = activity[i][:col_width]
+            # Highlight ACTIVITY header
+            if line.startswith("ACTIVITY:"):
+                self._safe_addstr(start_row + i, log_x, line, curses.color_pair(5) | curses.A_BOLD, col_width)
+            elif line.startswith("Timeline:") or line.startswith("Messages:") or line.startswith("Span:"):
+                self._safe_addstr(start_row + i, log_x, line, curses.color_pair(2), col_width)
+            elif "─" in line or "●" in line or "┌" in line or "├" in line or "└" in line:
+                self._safe_addstr(start_row + i, log_x, line, curses.color_pair(4), col_width)
+            else:
+                self._safe_addstr(start_row + i, log_x, line, curses.A_DIM, col_width)
+
+        # Temporal log section (below activity)
         log = self._wrap_lines(self.state.temporal_log, col_width)
+        log_start = start_row + activity_rows + 1
+        log_rows = visible_rows - activity_rows - 2
 
         # Section header
-        self._safe_addstr(start_row, log_x, "TEMPORAL LOG", curses.color_pair(1) | curses.A_BOLD, col_width)
-
-        log_start = start_row + 2
-        log_rows = visible_rows - 2
+        self._safe_addstr(log_start, log_x, "TEMPORAL LOG", curses.color_pair(1) | curses.A_BOLD, col_width)
+        log_start += 2
 
         # Show generating animation if in progress
         if self.state.log_generating:
@@ -555,9 +601,13 @@ TEMPORAL LOG:"""
         if visible_rows < 1:
             return
 
-        # Combine file tree and temporal log into single scrollable content
+        # Combine file tree, activity, and temporal log into single scrollable content
         combined = []
         combined.extend(self.state.file_tree)
+        combined.append("")
+        combined.append("─── ACTIVITY ───")
+        combined.append("")
+        combined.extend(self.state.activity_timeline)
         combined.append("")
         combined.append("─── TEMPORAL LOG ───")
         combined.append("")
@@ -586,6 +636,12 @@ TEMPORAL LOG:"""
                     color = curses.color_pair(4)
                 elif line.startswith("───"):
                     color = curses.color_pair(1) | curses.A_BOLD
+                elif line.startswith("ACTIVITY:"):
+                    color = curses.color_pair(5) | curses.A_BOLD
+                elif line.startswith("Timeline:") or line.startswith("Messages:") or line.startswith("Span:"):
+                    color = curses.color_pair(2)
+                elif "─" in line and ("●" in line or "┌" in line or "├" in line or "└" in line):
+                    color = curses.color_pair(4)
                 elif line.startswith('['):
                     bracket_end = line.find(']')
                     if bracket_end > 0:
@@ -607,10 +663,12 @@ TEMPORAL LOG:"""
 
         inner_width = width - 4
 
-        if inner_width > 40:
-            help_text = "h:back  l:resume  j/k:scroll"
+        if inner_width > 50:
+            help_text = "h:back  l:resume  f:fork  j/k:scroll"
+        elif inner_width > 40:
+            help_text = "h:back l:resume f:fork jk:nav"
         else:
-            help_text = "h:back l:resume jk:nav"
+            help_text = "h:back l:resume f:fork"
 
         self._safe_addstr(height - 2, 2, help_text, curses.color_pair(7) | curses.A_DIM, inner_width)
 
@@ -623,6 +681,88 @@ TEMPORAL LOG:"""
                 if pos_x > 2:
                     self._safe_addstr(height - 2, pos_x, pos, curses.color_pair(2))
 
+    def _render_input_dialog(self, height: int, width: int):
+        """Render an input dialog overlay."""
+        if not self.state:
+            return
+
+        # Dialog dimensions
+        dialog_width = min(60, width - 8)
+        dialog_height = 5
+        dialog_x = (width - dialog_width) // 2
+        dialog_y = (height - dialog_height) // 2
+
+        # Draw dialog box
+        self.stdscr.attron(curses.color_pair(1))
+
+        # Top border
+        self._safe_addstr(dialog_y, dialog_x, BOX_TL + BOX_H * (dialog_width - 2) + BOX_TR)
+
+        # Sides and content area
+        for i in range(1, dialog_height - 1):
+            self._safe_addstr(dialog_y + i, dialog_x, BOX_V)
+            self._safe_addstr(dialog_y + i, dialog_x + dialog_width - 1, BOX_V)
+            # Clear content area
+            self._safe_addstr(dialog_y + i, dialog_x + 1, " " * (dialog_width - 2))
+
+        # Bottom border
+        self._safe_addstr(dialog_y + dialog_height - 1, dialog_x,
+                         BOX_BL + BOX_H * (dialog_width - 2) + BOX_BR)
+
+        self.stdscr.attroff(curses.color_pair(1))
+
+        # Prompt text
+        self._safe_addstr(dialog_y + 1, dialog_x + 2, self.state.input_prompt,
+                         curses.color_pair(3) | curses.A_BOLD, dialog_width - 4)
+
+        # Input field
+        input_x = dialog_x + 2
+        input_y = dialog_y + 2
+        input_width = dialog_width - 4
+
+        # Draw input value with cursor
+        value = self.state.input_value
+        if len(value) > input_width - 1:
+            # Scroll to show cursor
+            start = max(0, self.state.input_cursor - input_width + 2)
+            value = value[start:start + input_width - 1]
+
+        self._safe_addstr(input_y, input_x, value, curses.A_NORMAL, input_width)
+
+        # Show cursor
+        cursor_pos = min(self.state.input_cursor, input_width - 1)
+        try:
+            curses.curs_set(1)  # Show cursor
+            self.stdscr.move(input_y, input_x + cursor_pos)
+        except curses.error:
+            pass
+
+        # Help text
+        self._safe_addstr(dialog_y + 3, dialog_x + 2, "Enter:confirm  Esc:cancel",
+                         curses.A_DIM, dialog_width - 4)
+
+    def start_input(self, mode: str, prompt: str, default: str = ""):
+        """Start input mode with the given prompt and default value."""
+        if not self.state:
+            return
+        self.state.input_mode = mode
+        self.state.input_prompt = prompt
+        self.state.input_value = default
+        self.state.input_cursor = len(default)
+
+    def cancel_input(self):
+        """Cancel input mode."""
+        if not self.state:
+            return
+        self.state.input_mode = ""
+        self.state.input_prompt = ""
+        self.state.input_value = ""
+        self.state.input_cursor = 0
+        try:
+            curses.curs_set(0)  # Hide cursor
+        except curses.error:
+            pass
+
     def _get_max_scroll(self) -> int:
         """Calculate maximum scroll offset."""
         if not self.state:
@@ -631,12 +771,13 @@ TEMPORAL LOG:"""
         height, width = self.stdscr.getmaxyx()
 
         if width >= WIDE_MODE_MIN_WIDTH:
-            # Two column: scroll based on longer of tree/log
+            # Two column: scroll based on longer of tree/log (activity is fixed at top)
             content_len = max(len(self.state.file_tree), len(self.state.temporal_log))
             visible = height - 10
         else:
-            # Single column: combined content
-            content_len = len(self.state.file_tree) + len(self.state.temporal_log) + 3
+            # Single column: combined content (file tree + activity + temporal log + separators)
+            content_len = (len(self.state.file_tree) + len(self.state.activity_timeline) +
+                          len(self.state.temporal_log) + 6)  # 6 for separators and spacing
             visible = height - 11
 
         return max(0, content_len - visible)
@@ -647,10 +788,15 @@ TEMPORAL LOG:"""
         Navigation follows ncdu/vim conventions:
         - j/k/↑/↓: scroll
         - l/Enter/→: forward (resume session)
+        - f: fork session to new directory
         - h/←/q/ESC: back to list
         """
         if not self.state:
             return None
+
+        # Handle input mode separately
+        if self.state.input_mode:
+            return self._handle_input_key(key)
 
         # Vertical scrolling
         if key in (ord("j"), curses.KEY_DOWN):
@@ -676,8 +822,88 @@ TEMPORAL LOG:"""
         elif key in (ord("l"), ord("\n"), curses.KEY_ENTER, curses.KEY_RIGHT, 10, 13):
             return "resume"
 
+        # Fork: f = fork session to new directory
+        elif key == ord("f"):
+            # Default to home directory
+            default_dir = str(Path.home())
+            self.start_input("fork", "Fork session into directory:", default_dir)
+
         # Back: h/←/q/ESC = back to list
         elif key in (ord("h"), curses.KEY_LEFT, ord("q"), 27):
             return "back"
+
+        return None
+
+    def _handle_input_key(self, key: int) -> Optional[str]:
+        """Handle keyboard input while in input mode."""
+        if not self.state or not self.state.input_mode:
+            return None
+
+        # Cancel on Escape
+        if key == 27:
+            self.cancel_input()
+            return None
+
+        # Submit on Enter
+        if key in (ord("\n"), curses.KEY_ENTER, 10, 13):
+            mode = self.state.input_mode
+            value = self.state.input_value
+            self.cancel_input()
+
+            if mode == "fork" and value:
+                # Expand ~ and resolve path
+                expanded = os.path.expanduser(value)
+                return f"fork:{expanded}"
+
+            return None
+
+        # Backspace
+        if key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.state.input_cursor > 0:
+                self.state.input_value = (
+                    self.state.input_value[:self.state.input_cursor - 1] +
+                    self.state.input_value[self.state.input_cursor:]
+                )
+                self.state.input_cursor -= 1
+            return None
+
+        # Delete
+        if key == curses.KEY_DC:
+            if self.state.input_cursor < len(self.state.input_value):
+                self.state.input_value = (
+                    self.state.input_value[:self.state.input_cursor] +
+                    self.state.input_value[self.state.input_cursor + 1:]
+                )
+            return None
+
+        # Cursor movement
+        if key == curses.KEY_LEFT:
+            self.state.input_cursor = max(0, self.state.input_cursor - 1)
+            return None
+        if key == curses.KEY_RIGHT:
+            self.state.input_cursor = min(len(self.state.input_value), self.state.input_cursor + 1)
+            return None
+        if key == curses.KEY_HOME or key == 1:  # Ctrl+A
+            self.state.input_cursor = 0
+            return None
+        if key == curses.KEY_END or key == 5:  # Ctrl+E
+            self.state.input_cursor = len(self.state.input_value)
+            return None
+
+        # Clear line: Ctrl+U
+        if key == 21:
+            self.state.input_value = ""
+            self.state.input_cursor = 0
+            return None
+
+        # Regular character input
+        if 32 <= key <= 126:
+            ch = chr(key)
+            self.state.input_value = (
+                self.state.input_value[:self.state.input_cursor] +
+                ch +
+                self.state.input_value[self.state.input_cursor:]
+            )
+            self.state.input_cursor += 1
 
         return None

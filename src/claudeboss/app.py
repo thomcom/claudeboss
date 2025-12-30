@@ -6,19 +6,69 @@ Navigate and manage Claude Code sessions from the terminal.
 import os
 import sys
 
-# Auto-detect terminfo path for various terminals
-if not os.environ.get('TERMINFO'):
+
+def _setup_terminal_env():
+    """Configure TERM/TERMINFO for curses compatibility across platforms.
+
+    Handles:
+    - Kitty terminal (xterm-kitty needs /usr/lib/kitty/terminfo)
+    - Standard terminals (xterm-256color in /usr/share/terminfo)
+    - macOS paths (/opt/homebrew/share/terminfo, /usr/share/terminfo)
+    - WSL/Linux distros (Ubuntu, Fedora, Arch all use /usr/share/terminfo)
+    """
+    term = os.environ.get('TERM', '')
+
+    # Known terminfo locations by priority
     terminfo_paths = [
-        '/usr/lib/kitty/terminfo',
-        '/usr/share/terminfo',
-        '/lib/terminfo',
+        '/usr/lib/kitty/terminfo',      # Kitty's custom terminfo
+        '/usr/share/terminfo',           # Standard Linux (Ubuntu, Fedora, Arch, WSL)
+        '/lib/terminfo',                 # Some minimal systems
+        '/opt/homebrew/share/terminfo',  # macOS Homebrew
+        '/usr/local/share/terminfo',     # macOS/BSD manual installs
     ]
-    for path in terminfo_paths:
-        if os.path.isdir(path):
-            os.environ['TERMINFO'] = path
-            break
-if not os.environ.get('TERM'):
+
+    def _terminfo_has(terminfo_dir: str, term_name: str) -> bool:
+        """Check if terminfo directory has definition for term_name."""
+        if not term_name or not os.path.isdir(terminfo_dir):
+            return False
+        # terminfo files are stored as first-char/term-name (e.g., x/xterm-256color)
+        first_char = term_name[0]
+        term_file = os.path.join(terminfo_dir, first_char, term_name)
+        return os.path.exists(term_file)
+
+    # If TERM is set, try to find the right TERMINFO for it
+    if term:
+        # Check if current TERMINFO (if set) works
+        current_terminfo = os.environ.get('TERMINFO', '')
+        if current_terminfo and _terminfo_has(current_terminfo, term):
+            return  # Current setup works
+
+        # Search for the right terminfo for this TERM
+        for path in terminfo_paths:
+            if _terminfo_has(path, term):
+                os.environ['TERMINFO'] = path
+                return
+
+        # TERM is set but we can't find its terminfo - fall back to xterm-256color
+        # This handles exotic terminals that don't have their terminfo installed
+        for path in terminfo_paths:
+            if _terminfo_has(path, 'xterm-256color'):
+                os.environ['TERM'] = 'xterm-256color'
+                os.environ['TERMINFO'] = path
+                return
+
+    # No TERM set - use xterm-256color (universally available)
     os.environ['TERM'] = 'xterm-256color'
+    for path in terminfo_paths:
+        if _terminfo_has(path, 'xterm-256color'):
+            os.environ['TERMINFO'] = path
+            return
+
+    # Last resort - hope /usr/share/terminfo exists
+    os.environ['TERMINFO'] = '/usr/share/terminfo'
+
+
+_setup_terminal_env()
 
 import curses
 import subprocess
@@ -177,6 +227,9 @@ class App:
                 self.mode = "list"
             elif action == "resume":
                 self._detail_resume()
+            elif action and action.startswith("fork:"):
+                fork_dir = action[5:]
+                self._detail_fork(fork_dir)
 
         elif self.mode == "help":
             if key in (ord("h"), curses.KEY_LEFT, ord("q"), 27, ord("\n"), 10, 13):
@@ -268,6 +321,7 @@ class App:
             "IN DETAIL VIEW",
             "  j/k           Scroll content",
             "  l, Enter      Resume session in kitty",
+            "  f             Fork session to new directory",
             "  h, q          Back to list",
             "",
             "ACTIONS",
@@ -316,11 +370,48 @@ class App:
             self._show_message("Session directory not found")
             return
 
+        # Use bash -c with exec to run claude, then drop to shell on exit
+        # This keeps the terminal open after claude exits (Ctrl+C)
+        cmd = f'claude --resume {session.uuid}; exec bash'
+
         try:
             subprocess.Popen([
                 "kitty",
                 "--directory", path,
-                "--", "claude", "--resume", session.uuid
+                "--", "bash", "-c", cmd
+            ], start_new_session=True)
+        except FileNotFoundError:
+            self._show_message("kitty not found")
+        except Exception as e:
+            self._show_message(f"Failed to launch: {e}")
+
+    def _detail_fork(self, fork_dir: str):
+        """Fork the session shown in detail view to a new directory."""
+        if not self.detail_view.state:
+            return
+        session = self.detail_view.state.session
+        self._fork_session(session, fork_dir)
+        self.mode = "list"
+
+    def _fork_session(self, session: Session, fork_dir: str):
+        """Open a new kitty terminal in fork_dir and resume the session there."""
+        if not session:
+            return
+
+        # Validate fork directory
+        fork_dir = os.path.expanduser(fork_dir)
+        if not os.path.isdir(fork_dir):
+            self._show_message(f"Directory not found: {fork_dir}")
+            return
+
+        # Use bash -c with exec to run claude, then drop to shell on exit
+        cmd = f'claude --resume {session.uuid}; exec bash'
+
+        try:
+            subprocess.Popen([
+                "kitty",
+                "--directory", fork_dir,
+                "--", "bash", "-c", cmd
             ], start_new_session=True)
         except FileNotFoundError:
             self._show_message("kitty not found")
